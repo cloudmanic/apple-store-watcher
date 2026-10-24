@@ -41,6 +41,7 @@ type Config struct {
 	LogFile              string    `json:"log_file"`
 	TextTo               []string  `json:"text_to"`
 	TextLink             string    `json:"text_link"`
+	SearchLocation       string    `json:"search_location"`
 	Stores               []Store   `json:"stores"`
 	Products             []Product `json:"products"`
 }
@@ -126,6 +127,10 @@ func (c *Config) Validate() error {
 		if !phoneNumberPattern.MatchString(n) {
 			problems = append(problems, fmt.Errorf("text_to %q must look like +15035551234", n))
 		}
+	}
+
+	if strings.TrimSpace(c.SearchLocation) == "" {
+		problems = append(problems, errors.New("search_location needs a zip code near the stores, like 97201"))
 	}
 
 	if len(c.Stores) == 0 {
@@ -229,6 +234,7 @@ func (c *Config) LogSummary(log *slog.Logger) {
 		"max_texts_per_trigger", c.MaxTextsPerTrigger,
 		"text_to", strings.Join(c.TextTo, ","),
 		"text_link", c.TextLink,
+		"search_location", c.SearchLocation,
 		"log_file", c.LogFile,
 	)
 

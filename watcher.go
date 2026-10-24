@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -20,16 +21,20 @@ import (
 // not push it back a whole check.
 const textSlack = time.Second
 
-// storeGap spaces out the per-store lookups so Apple does not see a burst.
-const storeGap = time.Second
-
 // maxTextLength keeps a text under Twilio's 1,600 character limit, with room
 // for the footer.
 const maxTextLength = 1400
 
+// How the watcher reacts when Apple blocks stock checks.
+const (
+	blockBackoffStart = 5 * time.Minute  // wait after the first blocked check
+	blockBackoffMax   = 30 * time.Minute // longest wait between tries
+	blockTextAfter    = 30 * time.Minute // text the user once a block lasts this long
+)
+
 // StockChecker is the part of AppleClient the watcher needs. Tests use a fake.
 type StockChecker interface {
-	CheckStore(ctx context.Context, storeNumber string, parts []string) ([]Availability, error)
+	CheckLocation(ctx context.Context, location string, parts []string) ([]Availability, error)
 }
 
 // Texter is the part of TwilioClient the watcher needs. Tests use a fake.
@@ -57,14 +62,19 @@ type Watcher struct {
 	texter   Texter
 	log      *slog.Logger
 	now      func() time.Time
-	pause    func(ctx context.Context, d time.Duration)
 	triggers map[string]*trigger
 	lastText time.Time
 	checks   int
+
+	// Block state. blockedSince is zero when Apple is not blocking us.
+	blockedSince  time.Time
+	blockedUntil  time.Time
+	backoff       time.Duration
+	blockTextSent bool
 }
 
-// NewWatcher wires a watcher to the real clock. Tests replace now and pause
-// so they run instantly.
+// NewWatcher wires a watcher to the real clock. Tests replace now so they
+// run instantly.
 func NewWatcher(cfg *Config, checker StockChecker, texter Texter, log *slog.Logger) *Watcher {
 	return &Watcher{
 		cfg:      cfg,
@@ -72,7 +82,6 @@ func NewWatcher(cfg *Config, checker StockChecker, texter Texter, log *slog.Logg
 		texter:   texter,
 		log:      log,
 		now:      time.Now,
-		pause:    sleepContext,
 		triggers: map[string]*trigger{},
 	}
 }
@@ -83,6 +92,7 @@ func NewWatcher(cfg *Config, checker StockChecker, texter Texter, log *slog.Logg
 func (w *Watcher) Run(ctx context.Context) {
 	w.log.Info("watcher running",
 		"check_every", w.cfg.CheckInterval(),
+		"search_location", w.cfg.SearchLocation,
 		"stores", len(w.cfg.Stores),
 		"products", len(w.cfg.Products),
 	)
@@ -103,40 +113,77 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 }
 
-// CheckOnce asks Apple about every store, updates which items are in stock,
-// and sends a text if one is due.
+// CheckOnce makes one lookup for all stores, updates which items are in
+// stock, and sends a text if one is due. While Apple is blocking us it
+// skips the lookup until the wait is over.
 func (w *Watcher) CheckOnce(ctx context.Context) {
 	w.checks++
 	started := w.now()
+
+	if started.Before(w.blockedUntil) {
+		w.log.Info("waiting out apple block; no lookup this check",
+			"check", w.checks,
+			"blocked_for", started.Sub(w.blockedSince).Round(time.Second),
+			"next_try_in", w.blockedUntil.Sub(started).Round(time.Second),
+		)
+
+		w.maybeBlockText(ctx, started)
+		w.maybeText(ctx, started)
+
+		return
+	}
+
 	parts := w.cfg.PartNumbers()
 
-	w.log.Debug("check starting", "check", w.checks, "stores", len(w.cfg.Stores), "products", len(parts))
+	w.log.Debug("check starting",
+		"check", w.checks,
+		"search_location", w.cfg.SearchLocation,
+		"stores", len(w.cfg.Stores),
+		"products", len(parts),
+	)
 
-	inStock := map[string]Availability{}
-	answered := map[string]bool{}
-	storesOK, storesFailed := 0, 0
-
-	for i, store := range w.cfg.Stores {
+	results, err := w.checker.CheckLocation(ctx, w.cfg.SearchLocation, parts)
+	if err != nil {
 		if ctx.Err() != nil {
 			return
 		}
 
-		if i > 0 {
-			w.pause(ctx, storeGap)
+		var blocked *BlockedError
+		if errors.As(err, &blocked) {
+			w.noteBlocked(started, blocked)
+			w.maybeBlockText(ctx, started)
+		} else {
+			w.log.Error("stock check failed; keeping current alerts and trying again next check",
+				"check", w.checks,
+				"error", err,
+			)
 		}
 
-		results, err := w.checker.CheckStore(ctx, store.Number, parts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
+		w.maybeText(ctx, started)
 
-			storesFailed++
-			w.log.Error("store check failed; keeping current alerts for this store",
+		return
+	}
+
+	w.noteUnblocked(ctx, started)
+
+	byStore := map[string][]Availability{}
+	for _, r := range results {
+		byStore[r.StoreNumber] = append(byStore[r.StoreNumber], r)
+	}
+
+	inStock := map[string]Availability{}
+	answered := map[string]bool{}
+	storesOK, storesMissing := 0, 0
+
+	for _, store := range w.cfg.Stores {
+		storeResults, ok := byStore[store.Number]
+		if !ok {
+			storesMissing++
+			w.log.Error("store not in apple's reply; set search_location closer to it",
 				"check", w.checks,
 				"store", store.Number,
 				"store_name", w.cfg.StoreName(store.Number, ""),
-				"error", err,
+				"search_location", w.cfg.SearchLocation,
 			)
 
 			continue
@@ -144,7 +191,7 @@ func (w *Watcher) CheckOnce(ctx context.Context) {
 
 		storesOK++
 
-		for _, r := range results {
+		for _, r := range storeResults {
 			key := triggerKey(r.StoreNumber, r.Part)
 			answered[key] = true
 
@@ -173,15 +220,76 @@ func (w *Watcher) CheckOnce(ctx context.Context) {
 		"check", w.checks,
 		"took", w.now().Sub(started).Round(time.Millisecond),
 		"stores_ok", storesOK,
-		"stores_failed", storesFailed,
+		"stores_missing", storesMissing,
 		"in_stock_now", len(inStock),
 		"active_alerts", len(w.triggers),
 	)
 }
 
+// noteBlocked starts or stretches the wait after Apple blocks us. The wait
+// doubles each time, up to blockBackoffMax, so our own retries do not keep
+// the block going.
+func (w *Watcher) noteBlocked(now time.Time, err *BlockedError) {
+	if w.blockedSince.IsZero() {
+		w.blockedSince = now
+		w.backoff = blockBackoffStart
+	} else {
+		w.backoff = min(w.backoff*2, blockBackoffMax)
+	}
+
+	w.blockedUntil = now.Add(w.backoff)
+
+	w.log.Error("APPLE IS BLOCKING STOCK CHECKS; waiting before the next try",
+		"check", w.checks,
+		"http_status", err.Status,
+		"blocked_for", now.Sub(w.blockedSince).Round(time.Second),
+		"next_try_in", w.backoff,
+		"next_try_at", w.blockedUntil.Format(time.TimeOnly),
+	)
+}
+
+// noteUnblocked clears the block state after a good reply. If the user was
+// told about the block, it tells them checks work again.
+func (w *Watcher) noteUnblocked(ctx context.Context, now time.Time) {
+	if w.blockedSince.IsZero() {
+		return
+	}
+
+	w.log.Warn("apple block cleared; checks work again", "blocked_for", now.Sub(w.blockedSince).Round(time.Second))
+
+	if w.blockTextSent {
+		w.sendToAll(ctx, "Apple store watcher: stock checks work again.")
+	}
+
+	w.blockedSince = time.Time{}
+	w.blockedUntil = time.Time{}
+	w.backoff = 0
+	w.blockTextSent = false
+}
+
+// maybeBlockText texts the user once when a block has lasted
+// blockTextAfter. During a block the watcher cannot see stock, and without
+// this text it would stay silent.
+func (w *Watcher) maybeBlockText(ctx context.Context, now time.Time) {
+	if w.blockedSince.IsZero() || w.blockTextSent {
+		return
+	}
+
+	blockedFor := now.Sub(w.blockedSince)
+	if blockedFor < blockTextAfter {
+		return
+	}
+
+	body := fmt.Sprintf("Apple store watcher: Apple has blocked stock checks for %d minutes. The watcher cannot see stock right now. It keeps trying.", int(blockedFor.Minutes()))
+
+	if w.sendToAll(ctx, body) > 0 {
+		w.blockTextSent = true
+	}
+}
+
 // updateTriggers starts a trigger for each newly in-stock item and clears
-// triggers Apple now says are out of stock. A store whose check failed has
-// no answer, so its triggers stay as they were.
+// triggers Apple now says are out of stock. A store missing from the reply
+// has no answer, so its triggers stay as they were.
 func (w *Watcher) updateTriggers(inStock map[string]Availability, answered map[string]bool, now time.Time) {
 	for _, key := range slices.Sorted(maps.Keys(inStock)) {
 		r := inStock[key]
@@ -276,23 +384,7 @@ func (w *Watcher) maybeText(ctx context.Context, now time.Time) {
 		}
 	}
 
-	body := w.buildMessage(due)
-
-	w.log.Info("sending text", "recipients", len(w.cfg.TextTo), "items", len(due), "body", body)
-
-	sent := 0
-	for _, to := range w.cfg.TextTo {
-		sid, err := w.texter.SendText(ctx, to, body)
-		if err != nil {
-			w.log.Error("text failed", "to", to, "error", err)
-			continue
-		}
-
-		sent++
-		w.log.Info("text sent", "to", to, "twilio_sid", sid)
-	}
-
-	if sent == 0 {
+	if w.sendToAll(ctx, w.buildMessage(due)) == 0 {
 		w.log.Error("no texts went out; trying again next check")
 		return
 	}
@@ -311,6 +403,27 @@ func (w *Watcher) maybeText(ctx context.Context, now time.Time) {
 	}
 
 	w.log.Info("next text due", "at", now.Add(w.cfg.TextInterval()).Format(time.TimeOnly))
+}
+
+// sendToAll texts body to every number in text_to and returns how many went
+// out. One failed number does not stop the others.
+func (w *Watcher) sendToAll(ctx context.Context, body string) int {
+	w.log.Info("sending text", "recipients", len(w.cfg.TextTo), "body", body)
+
+	sent := 0
+
+	for _, to := range w.cfg.TextTo {
+		sid, err := w.texter.SendText(ctx, to, body)
+		if err != nil {
+			w.log.Error("text failed", "to", to, "error", err)
+			continue
+		}
+
+		sent++
+		w.log.Info("text sent", "to", to, "twilio_sid", sid)
+	}
+
+	return sent
 }
 
 // buildMessage writes the text body: one line per in-stock item, then the
@@ -356,16 +469,4 @@ func (w *Watcher) buildMessage(due []*trigger) string {
 // triggerKey names one store and part pair in the triggers map.
 func triggerKey(storeNumber, part string) string {
 	return storeNumber + "|" + part
-}
-
-// sleepContext waits for d, or less if ctx is cancelled, so Ctrl-C is not
-// held up by the pause between stores.
-func sleepContext(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-
-	select {
-	case <-ctx.Done():
-	case <-t.C:
-	}
 }

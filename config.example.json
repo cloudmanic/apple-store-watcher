@@ -5,6 +5,7 @@
   "log_file": "watcher.log",
   "text_to": ["+15035551234"],
   "text_link": "https://www.apple.com/shop/buy-iphone/iphone-duo",
+  "search_location": "97201",
   "stores": [
     { "number": "R077", "name": "Pioneer Place (Portland)" },
     { "number": "R090", "name": "Washington Square (Tigard)" },

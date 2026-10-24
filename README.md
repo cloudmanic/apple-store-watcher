@@ -55,6 +55,19 @@ Logs go to the screen and to `watcher.log`.
 - Each alert stops after 30 texts. If the item sells out and comes back, it
   starts a new alert.
 
+## How it asks Apple
+
+- Each check is one lookup by zip code (`search_location`). Apple's reply
+  lists all nearby stores, and the watcher keeps only the stores in the
+  config.
+- If a watched store is not in the reply, the log says so. Pick a zip code
+  closer to that store.
+- Apple blocks lookups if we ask too often. It sends HTTP 541 with a
+  "Page Not Found" page. When that happens, the watcher waits 5 minutes,
+  then 10, then 20, then 30 between tries.
+- If a block lasts 30 minutes, you get one text. When checks work again, you
+  get a second text.
+
 ## Config
 
 | Key | Default | What it does |
@@ -65,6 +78,7 @@ Logs go to the screen and to `watcher.log`.
 | `log_file` | `watcher.log` | Where the log file goes |
 | `text_to` | (required) | Phone numbers to text, like `+15035551234` |
 | `text_link` | (none) | Link added to the end of each text |
+| `search_location` | (required) | Zip code near the stores, like `97201` |
 | `stores` | (required) | Apple store numbers, like `R077` |
 | `products` | (required) | Apple part numbers, like `MK1E4LL/A` |
 

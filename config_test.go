@@ -31,6 +31,7 @@ func writeConfig(t *testing.T, body string) string {
 func TestLoadConfigAppliesDefaults(t *testing.T) {
 	path := writeConfig(t, `{
 		"text_to": ["+15035551234"],
+		"search_location": "97201",
 		"stores": [{"number": "R077"}],
 		"products": [{"part": "MK1E4LL/A"}]
 	}`)
@@ -64,8 +65,8 @@ func TestLoadConfigExampleFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(cfg.Stores) != 3 || len(cfg.Products) != 8 {
-		t.Errorf("got %d stores and %d products, want 3 and 8", len(cfg.Stores), len(cfg.Products))
+	if len(cfg.Stores) != 3 || len(cfg.Products) != 8 || cfg.SearchLocation != "97201" {
+		t.Errorf("got %d stores, %d products, location %q; want 3, 8, 97201", len(cfg.Stores), len(cfg.Products), cfg.SearchLocation)
 	}
 }
 
@@ -118,14 +119,15 @@ func TestValidateListsEveryProblem(t *testing.T) {
 	}
 }
 
-// TestValidateEmptyLists checks stores, products and phone numbers are required.
+// TestValidateEmptyLists checks stores, products, phone numbers and the
+// search location are required.
 func TestValidateEmptyLists(t *testing.T) {
 	err := (&Config{}).Validate()
 	if err == nil {
 		t.Fatal("want errors, got nil")
 	}
 
-	for _, want := range []string{"text_to", "stores", "products"} {
+	for _, want := range []string{"text_to", "search_location", "stores", "products"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error is missing %q:\n%v", want, err)
 		}

@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,41 +19,44 @@ import (
 	"testing"
 )
 
-// fakeAppleReply builds a pickup-message reply for one store. Parts listed
-// in available are "available"; the rest are "unavailable".
-func fakeAppleReply(storeNumber string, parts []string, available map[string]bool) []byte {
-	pa := map[string]any{}
+// fakeAppleReply builds a pickup-message reply listing each store in
+// stores. Parts in available ("store|part") are "available"; the rest are
+// "unavailable".
+func fakeAppleReply(stores, parts []string, available map[string]bool) []byte {
+	var storeList []any
 
-	for _, p := range parts {
-		display, quote := "unavailable", "Unavailable for Pickup"
-		if available[p] {
-			display, quote = "available", "Available Today"
+	for _, store := range stores {
+		pa := map[string]any{}
+
+		for _, p := range parts {
+			display, quote := "unavailable", "Unavailable for Pickup"
+			if available[store+"|"+p] {
+				display, quote = "available", "Available Today"
+			}
+
+			pa[p] = map[string]any{
+				"partNumber":        p,
+				"pickupDisplay":     display,
+				"pickupSearchQuote": quote,
+				"messageTypes": map[string]any{
+					"regular": map[string]any{"storePickupProductTitle": "Title " + p},
+				},
+			}
 		}
 
-		pa[p] = map[string]any{
-			"partNumber":        p,
-			"pickupDisplay":     display,
-			"pickupSearchQuote": quote,
-			"messageTypes": map[string]any{
-				"regular": map[string]any{"storePickupProductTitle": "Title " + p},
-			},
-		}
+		storeList = append(storeList, map[string]any{
+			"storeNumber":       store,
+			"storeName":         "Store " + store,
+			"city":              "Portland",
+			"state":             "OR",
+			"partsAvailability": pa,
+		})
 	}
 
-	reply := map[string]any{
+	out, _ := json.Marshal(map[string]any{
 		"head": map[string]any{"status": "200"},
-		"body": map[string]any{
-			"stores": []any{map[string]any{
-				"storeNumber":       storeNumber,
-				"storeName":         "Store " + storeNumber,
-				"city":              "Portland",
-				"state":             "OR",
-				"partsAvailability": pa,
-			}},
-		},
-	}
-
-	out, _ := json.Marshal(reply)
+		"body": map[string]any{"stores": storeList},
+	})
 
 	return out
 }
@@ -80,57 +84,70 @@ func partsFromQuery(r *http.Request) []string {
 	}
 }
 
-// TestCheckStoreParsesReply checks statuses, names and quotes come through,
-// and the request carries the store, parts and a browser user agent.
-func TestCheckStoreParsesReply(t *testing.T) {
+// TestCheckLocationParsesReply checks one lookup returns every store in the
+// reply, with statuses, names and quotes, and that the request carries the
+// zip code, parts and a browser user agent.
+func TestCheckLocationParsesReply(t *testing.T) {
+	requests := 0
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+
 		if r.URL.Path != "/shop/retail/pickup-message" {
 			t.Errorf("path = %s", r.URL.Path)
 		}
 
-		if got := r.URL.Query().Get("store"); got != "R077" {
-			t.Errorf("store = %s, want R077", got)
+		if got := r.URL.Query().Get("location"); got != "97201" {
+			t.Errorf("location = %s, want 97201", got)
+		}
+
+		if r.URL.Query().Has("store") {
+			t.Error("request should not name a store")
 		}
 
 		if !strings.Contains(r.Header.Get("User-Agent"), "Mozilla") {
 			t.Errorf("user agent = %q, want a browser name", r.Header.Get("User-Agent"))
 		}
 
-		w.Write(fakeAppleReply("R077", partsFromQuery(r), map[string]bool{"B/A": true}))
+		w.Write(fakeAppleReply([]string{"R077", "R090"}, partsFromQuery(r), map[string]bool{"R090|B/A": true}))
 	}))
 	defer srv.Close()
 
-	got, err := newTestAppleClient(srv.URL).CheckStore(context.Background(), "R077", []string{"A/A", "B/A"})
+	got, err := newTestAppleClient(srv.URL).CheckLocation(context.Background(), "97201", []string{"A/A", "B/A"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("got %d results, want 2", len(got))
+	if requests != 1 {
+		t.Errorf("made %d requests, want 1", requests)
 	}
 
-	if got[0].Part != "A/A" || got[0].Available() || got[0].Quote != "Unavailable for Pickup" {
-		t.Errorf("first result = %+v", got[0])
+	if len(got) != 4 {
+		t.Fatalf("got %d results, want 4 (2 stores x 2 parts)", len(got))
 	}
 
-	if got[1].Part != "B/A" || !got[1].Available() || got[1].Quote != "Available Today" {
-		t.Errorf("second result = %+v", got[1])
-	}
+	for _, r := range got {
+		wantAvailable := r.StoreNumber == "R090" && r.Part == "B/A"
 
-	if got[1].StoreName != "Store R077" || got[1].Title != "Title B/A" {
-		t.Errorf("names = %q / %q", got[1].StoreName, got[1].Title)
+		if r.Available() != wantAvailable {
+			t.Errorf("%s %s available = %v, want %v", r.StoreNumber, r.Part, r.Available(), wantAvailable)
+		}
+
+		if r.StoreName != "Store "+r.StoreNumber || r.Title != "Title "+r.Part {
+			t.Errorf("names = %q / %q", r.StoreName, r.Title)
+		}
 	}
 }
 
-// TestCheckStoreSplitsLargeLists checks more than 8 parts go out in batches
-// and come back as one list.
-func TestCheckStoreSplitsLargeLists(t *testing.T) {
+// TestCheckLocationSplitsLargeLists checks more than 8 parts go out in
+// batches and come back as one list.
+func TestCheckLocationSplitsLargeLists(t *testing.T) {
 	var batches []int
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parts := partsFromQuery(r)
 		batches = append(batches, len(parts))
-		w.Write(fakeAppleReply("R077", parts, nil))
+		w.Write(fakeAppleReply([]string{"R077"}, parts, nil))
 	}))
 	defer srv.Close()
 
@@ -139,7 +156,7 @@ func TestCheckStoreSplitsLargeLists(t *testing.T) {
 		parts[i] = fmt.Sprintf("P%02d", i)
 	}
 
-	got, err := newTestAppleClient(srv.URL).CheckStore(context.Background(), "R077", parts)
+	got, err := newTestAppleClient(srv.URL).CheckLocation(context.Background(), "97201", parts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,18 +170,40 @@ func TestCheckStoreSplitsLargeLists(t *testing.T) {
 	}
 }
 
-// TestCheckStoreErrors checks each kind of bad reply becomes a clear error.
-func TestCheckStoreErrors(t *testing.T) {
+// TestCheckLocationBlocked checks Apple's limit codes become a BlockedError,
+// so the watcher knows to wait longer.
+func TestCheckLocationBlocked(t *testing.T) {
+	for _, status := range []int{541, 429, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				io.WriteString(w, "<html><title>Page Not Found - Apple</title></html>")
+			}))
+			defer srv.Close()
+
+			_, err := newTestAppleClient(srv.URL).CheckLocation(context.Background(), "97201", []string{"A/A"})
+
+			var blocked *BlockedError
+			if !errors.As(err, &blocked) || blocked.Status != status {
+				t.Fatalf("want BlockedError with status %d, got %v", status, err)
+			}
+		})
+	}
+}
+
+// TestCheckLocationErrors checks each other kind of bad reply becomes a
+// plain error, not a block.
+func TestCheckLocationErrors(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
 		body   string
 		want   string
 	}{
-		{"http error", 503, "<html>busy</html>", "HTTP 503"},
+		{"http error", 500, "<html>oops</html>", "HTTP 500"},
 		{"not json", 200, "<html>hi</html>", "not JSON"},
 		{"apple error", 200, `{"body":{"errorMessage":"Product(s) Invalid or not buyable"}}`, "Product(s) Invalid"},
-		{"store missing", 200, `{"body":{"stores":[{"storeNumber":"R999"}]}}`, "did not include store R077"},
+		{"no stores", 200, `{"body":{"stores":[]}}`, "no stores near"},
 	}
 
 	for _, c := range cases {
@@ -175,23 +214,28 @@ func TestCheckStoreErrors(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			_, err := newTestAppleClient(srv.URL).CheckStore(context.Background(), "R077", []string{"A/A"})
+			_, err := newTestAppleClient(srv.URL).CheckLocation(context.Background(), "97201", []string{"A/A"})
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("want error with %q, got %v", c.want, err)
+			}
+
+			var blocked *BlockedError
+			if errors.As(err, &blocked) {
+				t.Errorf("got a BlockedError, want a plain error")
 			}
 		})
 	}
 }
 
-// TestCheckStoreSkipsMissingPart checks a part Apple left out is skipped,
+// TestCheckLocationSkipsMissingPart checks a part Apple left out is skipped,
 // not reported as out of stock.
-func TestCheckStoreSkipsMissingPart(t *testing.T) {
+func TestCheckLocationSkipsMissingPart(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(fakeAppleReply("R077", []string{"A/A"}, nil))
+		w.Write(fakeAppleReply([]string{"R077"}, []string{"A/A"}, nil))
 	}))
 	defer srv.Close()
 
-	got, err := newTestAppleClient(srv.URL).CheckStore(context.Background(), "R077", []string{"A/A", "B/A"})
+	got, err := newTestAppleClient(srv.URL).CheckLocation(context.Background(), "97201", []string{"A/A", "B/A"})
 	if err != nil {
 		t.Fatal(err)
 	}

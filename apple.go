@@ -34,6 +34,25 @@ const appleUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWeb
 // part on hand for pickup.
 const appleAvailable = "available"
 
+// appleBlockStatuses are the HTTP codes Apple sends when it limits us. 541
+// is Apple's own code and comes with a "Page Not Found" page.
+var appleBlockStatuses = map[int]bool{
+	http.StatusTooManyRequests:    true,
+	http.StatusServiceUnavailable: true,
+	541:                           true,
+}
+
+// BlockedError means Apple turned the lookup away because we asked too
+// often. The watcher waits longer before the next try when it sees one.
+type BlockedError struct {
+	Status int
+}
+
+// Error says Apple is blocking us and which HTTP code it sent.
+func (e *BlockedError) Error() string {
+	return fmt.Sprintf("apple is blocking stock checks (HTTP %d)", e.Status)
+}
+
 // Availability is Apple's answer for one part at one store.
 type Availability struct {
 	StoreNumber string
@@ -95,16 +114,18 @@ type pickupPart struct {
 	} `json:"messageTypes"`
 }
 
-// CheckStore returns the stock of each part at one store. Large part lists
-// are split into batches Apple will accept. Any failed batch fails the whole
-// store, so the caller never acts on half an answer.
-func (c *AppleClient) CheckStore(ctx context.Context, storeNumber string, parts []string) ([]Availability, error) {
-	all := make([]Availability, 0, len(parts))
+// CheckLocation returns the stock of each part at every store Apple lists
+// near location (a zip code). One lookup covers all nearby stores, which
+// keeps us well under Apple's limit. Large part lists are split into
+// batches Apple will accept; any failed batch fails the whole check, so the
+// caller never acts on half an answer.
+func (c *AppleClient) CheckLocation(ctx context.Context, location string, parts []string) ([]Availability, error) {
+	var all []Availability
 
 	for start := 0; start < len(parts); start += appleMaxPartsPerRequest {
 		end := min(start+appleMaxPartsPerRequest, len(parts))
 
-		got, err := c.checkBatch(ctx, storeNumber, parts[start:end])
+		got, err := c.checkBatch(ctx, location, parts[start:end])
 		if err != nil {
 			return nil, err
 		}
@@ -116,10 +137,10 @@ func (c *AppleClient) CheckStore(ctx context.Context, storeNumber string, parts 
 }
 
 // checkBatch makes one pickup-message request for up to
-// appleMaxPartsPerRequest parts at one store.
-func (c *AppleClient) checkBatch(ctx context.Context, storeNumber string, parts []string) ([]Availability, error) {
+// appleMaxPartsPerRequest parts near location.
+func (c *AppleClient) checkBatch(ctx context.Context, location string, parts []string) ([]Availability, error) {
 	q := url.Values{}
-	q.Set("store", storeNumber)
+	q.Set("location", location)
 
 	for i, p := range parts {
 		q.Set(fmt.Sprintf("parts.%d", i), p)
@@ -129,77 +150,79 @@ func (c *AppleClient) checkBatch(ctx context.Context, storeNumber string, parts 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build apple request for store %s: %w", storeNumber, err)
+		return nil, fmt.Errorf("build apple request: %w", err)
 	}
 
 	req.Header.Set("User-Agent", appleUserAgent)
 	req.Header.Set("Accept", "application/json")
 
-	c.Log.Debug("apple request", "store", storeNumber, "parts", strings.Join(parts, ","), "url", reqURL)
+	c.Log.Debug("apple request", "location", location, "parts", strings.Join(parts, ","), "url", reqURL)
 
 	started := time.Now()
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("apple request for store %s: %w", storeNumber, err)
+		return nil, fmt.Errorf("apple request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read apple reply for store %s: %w", storeNumber, err)
+		return nil, fmt.Errorf("read apple reply: %w", err)
 	}
 
 	c.Log.Debug("apple response",
-		"store", storeNumber,
+		"location", location,
 		"http_status", resp.StatusCode,
 		"bytes", len(body),
 		"took", time.Since(started).Round(time.Millisecond),
 	)
 
+	if appleBlockStatuses[resp.StatusCode] {
+		return nil, &BlockedError{Status: resp.StatusCode}
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("apple returned HTTP %d for store %s: %s", resp.StatusCode, storeNumber, snippet(body))
+		return nil, fmt.Errorf("apple returned HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 
 	var parsed pickupResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("apple reply for store %s was not JSON (%v): %s", storeNumber, err, snippet(body))
+		return nil, fmt.Errorf("apple reply was not JSON (%v): %s", err, snippet(body))
 	}
 
 	if msg := parsed.Body.ErrorMessage; msg != "" {
-		return nil, fmt.Errorf("apple refused the lookup for store %s: %q (check these part numbers: %s)", storeNumber, msg, strings.Join(parts, ","))
+		return nil, fmt.Errorf("apple refused the lookup: %q (check search_location %q and these part numbers: %s)", msg, location, strings.Join(parts, ","))
 	}
 
-	var store *pickupStore
-	for i := range parsed.Body.Stores {
-		if parsed.Body.Stores[i].StoreNumber == storeNumber {
-			store = &parsed.Body.Stores[i]
-			break
+	if len(parsed.Body.Stores) == 0 {
+		return nil, fmt.Errorf("apple found no stores near %q", location)
+	}
+
+	storeNumbers := make([]string, 0, len(parsed.Body.Stores))
+	out := make([]Availability, 0, len(parsed.Body.Stores)*len(parts))
+
+	for _, store := range parsed.Body.Stores {
+		storeNumbers = append(storeNumbers, store.StoreNumber)
+
+		for _, p := range parts {
+			pa, ok := store.PartsAvailability[p]
+			if !ok {
+				continue
+			}
+
+			out = append(out, Availability{
+				StoreNumber: store.StoreNumber,
+				StoreName:   store.StoreName,
+				Part:        p,
+				Title:       pa.MessageTypes.Regular.StorePickupProductTitle,
+				Display:     pa.PickupDisplay,
+				Quote:       pa.PickupSearchQuote,
+			})
 		}
 	}
 
-	if store == nil {
-		return nil, fmt.Errorf("apple reply did not include store %s (it had %d other stores)", storeNumber, len(parsed.Body.Stores))
-	}
-
-	out := make([]Availability, 0, len(parts))
-
-	for _, p := range parts {
-		pa, ok := store.PartsAvailability[p]
-		if !ok {
-			c.Log.Warn("apple reply is missing a part; skipping it this check", "store", storeNumber, "part", p)
-			continue
-		}
-
-		out = append(out, Availability{
-			StoreNumber: store.StoreNumber,
-			StoreName:   store.StoreName,
-			Part:        p,
-			Title:       pa.MessageTypes.Regular.StorePickupProductTitle,
-			Display:     pa.PickupDisplay,
-			Quote:       pa.PickupSearchQuote,
-		})
-	}
+	c.Log.Debug("apple reply stores", "location", location, "stores", strings.Join(storeNumbers, ","))
 
 	return out, nil
 }

@@ -17,27 +17,35 @@ import (
 	"time"
 )
 
-// fakeChecker returns whatever stock the test sets for each store.
+// fakeChecker answers lookups from stock the test sets, and records when
+// each lookup happened.
 type fakeChecker struct {
+	stores  []string                   // stores included in each reply
 	inStock map[string]map[string]bool // store -> part -> in stock
-	errs    map[string]error
+	err     error
+	now     func() time.Time
+	calls   []time.Time
 }
 
-// CheckStore answers from the fake's maps instead of calling Apple.
-func (f *fakeChecker) CheckStore(_ context.Context, store string, parts []string) ([]Availability, error) {
-	if err := f.errs[store]; err != nil {
-		return nil, err
+// CheckLocation answers from the fake's maps instead of calling Apple.
+func (f *fakeChecker) CheckLocation(_ context.Context, _ string, parts []string) ([]Availability, error) {
+	f.calls = append(f.calls, f.now())
+
+	if f.err != nil {
+		return nil, f.err
 	}
 
-	out := make([]Availability, 0, len(parts))
+	var out []Availability
 
-	for _, p := range parts {
-		a := Availability{StoreNumber: store, Part: p, Display: "unavailable", Quote: "Unavailable for Pickup"}
-		if f.inStock[store][p] {
-			a.Display, a.Quote = "available", "Available Today"
+	for _, store := range f.stores {
+		for _, p := range parts {
+			a := Availability{StoreNumber: store, Part: p, Display: "unavailable", Quote: "Unavailable for Pickup"}
+			if f.inStock[store][p] {
+				a.Display, a.Quote = "available", "Available Today"
+			}
+
+			out = append(out, a)
 		}
-
-		out = append(out, a)
 	}
 
 	return out, nil
@@ -74,6 +82,7 @@ type testHarness struct {
 	w       *Watcher
 	checker *fakeChecker
 	texter  *fakeTexter
+	start   time.Time
 	clock   time.Time
 }
 
@@ -83,22 +92,28 @@ func newHarness(t *testing.T) *testHarness {
 	t.Helper()
 
 	cfg := &Config{
-		TextTo:   []string{"+15035551234"},
-		TextLink: "https://example.com/buy",
-		Stores:   []Store{{Number: "R077", Name: "Pioneer Place"}, {Number: "R090", Name: "Washington Square"}},
-		Products: []Product{{Part: "A/A", Name: "Phone A"}, {Part: "B/A", Name: "Phone B"}},
+		TextTo:         []string{"+15035551234"},
+		TextLink:       "https://example.com/buy",
+		SearchLocation: "97201",
+		Stores:         []Store{{Number: "R077", Name: "Pioneer Place"}, {Number: "R090", Name: "Washington Square"}},
+		Products:       []Product{{Part: "A/A", Name: "Phone A"}, {Part: "B/A", Name: "Phone B"}},
 	}
 	cfg.applyDefaults()
 
 	h := &testHarness{
-		checker: &fakeChecker{inStock: map[string]map[string]bool{}, errs: map[string]error{}},
-		texter:  &fakeTexter{},
-		clock:   time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC),
+		texter: &fakeTexter{},
+		start:  time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC),
+	}
+	h.clock = h.start
+
+	h.checker = &fakeChecker{
+		stores:  []string{"R077", "R090", "R999"},
+		inStock: map[string]map[string]bool{},
+		now:     func() time.Time { return h.clock },
 	}
 
 	h.w = NewWatcher(cfg, h.checker, h.texter, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h.w.now = func() time.Time { return h.clock }
-	h.w.pause = func(context.Context, time.Duration) {}
 
 	return h
 }
@@ -110,10 +125,44 @@ func (h *testHarness) runFor(d time.Duration) {
 	}
 }
 
+// callMinutes lists when each Apple lookup happened, in minutes from start.
+func (h *testHarness) callMinutes() []int {
+	var mins []int
+
+	for _, c := range h.checker.calls {
+		mins = append(mins, int(c.Sub(h.start).Minutes()))
+	}
+
+	return mins
+}
+
+// TestOneLookupPerCheck checks every check makes exactly one Apple lookup,
+// no matter how many stores are watched.
+func TestOneLookupPerCheck(t *testing.T) {
+	h := newHarness(t)
+	h.runFor(5 * time.Minute)
+
+	if len(h.checker.calls) != 5 {
+		t.Errorf("made %d lookups in 5 checks, want 5", len(h.checker.calls))
+	}
+}
+
 // TestNoStockNoText checks nothing is sent while everything is out of stock.
 func TestNoStockNoText(t *testing.T) {
 	h := newHarness(t)
 	h.runFor(10 * time.Minute)
+
+	if len(h.texter.sent) != 0 {
+		t.Errorf("sent %d texts, want 0", len(h.texter.sent))
+	}
+}
+
+// TestUnwatchedStoreIgnored checks stock at a store not in the config (but
+// in Apple's reply) does not trigger a text.
+func TestUnwatchedStoreIgnored(t *testing.T) {
+	h := newHarness(t)
+	h.checker.set("R999", "A/A", true)
+	h.runFor(5 * time.Minute)
 
 	if len(h.texter.sent) != 0 {
 		t.Errorf("sent %d texts, want 0", len(h.texter.sent))
@@ -238,13 +287,14 @@ func TestNewStockElsewhereAfterLimit(t *testing.T) {
 	}
 }
 
-// TestFailedStoreKeepsTrigger checks an Apple error does not clear an alert.
-func TestFailedStoreKeepsTrigger(t *testing.T) {
+// TestStoreMissingFromReplyKeepsTrigger checks a store Apple left out of
+// its reply keeps its alert instead of clearing it.
+func TestStoreMissingFromReplyKeepsTrigger(t *testing.T) {
 	h := newHarness(t)
 	h.checker.set("R077", "A/A", true)
 	h.w.CheckOnce(context.Background())
 
-	h.checker.errs["R077"] = errors.New("apple is down")
+	h.checker.stores = []string{"R090"}
 	h.clock = h.clock.Add(3 * time.Minute)
 	h.w.CheckOnce(context.Background())
 
@@ -254,6 +304,124 @@ func TestFailedStoreKeepsTrigger(t *testing.T) {
 
 	if len(h.texter.sent) != 2 {
 		t.Errorf("sent %d texts, want 2", len(h.texter.sent))
+	}
+}
+
+// TestFailedCheckKeepsTextingAlerts checks a plain Apple error keeps the
+// current alerts and their 3 minute texts going, and retries next check.
+func TestFailedCheckKeepsTextingAlerts(t *testing.T) {
+	h := newHarness(t)
+	h.checker.set("R077", "A/A", true)
+	h.w.CheckOnce(context.Background())
+
+	h.checker.err = errors.New("connection reset")
+	h.clock = h.clock.Add(time.Minute)
+	h.runFor(3 * time.Minute)
+
+	if len(h.w.triggers) != 1 {
+		t.Errorf("triggers = %d, want 1", len(h.w.triggers))
+	}
+
+	if len(h.texter.sent) != 2 {
+		t.Errorf("sent %d texts, want 2", len(h.texter.sent))
+	}
+
+	if got := fmt.Sprint(h.callMinutes()); got != "[0 1 2 3]" {
+		t.Errorf("lookups at minutes %s, want [0 1 2 3]", got)
+	}
+}
+
+// TestBlockBacksOff checks the wait after a block goes 5, 10, 20, then 30
+// minutes, with no lookups in between.
+func TestBlockBacksOff(t *testing.T) {
+	h := newHarness(t)
+	h.checker.err = &BlockedError{Status: 541}
+
+	h.runFor(100 * time.Minute)
+
+	if got := fmt.Sprint(h.callMinutes()); got != "[0 5 15 35 65 95]" {
+		t.Errorf("lookups at minutes %s, want [0 5 15 35 65 95]", got)
+	}
+}
+
+// TestBlockTextsOnceAfterThirtyMinutes checks the user gets one text when a
+// block reaches 30 minutes, and no more while it lasts.
+func TestBlockTextsOnceAfterThirtyMinutes(t *testing.T) {
+	h := newHarness(t)
+	h.checker.err = &BlockedError{Status: 541}
+
+	h.runFor(30 * time.Minute)
+
+	if len(h.texter.sent) != 0 {
+		t.Fatalf("sent %d texts before 30 minutes, want 0", len(h.texter.sent))
+	}
+
+	h.runFor(2 * time.Hour)
+
+	if len(h.texter.sent) != 1 {
+		t.Fatalf("sent %d texts, want 1", len(h.texter.sent))
+	}
+
+	if !strings.Contains(h.texter.sent[0], "blocked stock checks for 30 minutes") {
+		t.Errorf("text = %q", h.texter.sent[0])
+	}
+}
+
+// TestBlockClearedTextsWorksAgain checks that after a long block, the first
+// good lookup texts "work again" and checks go back to every minute.
+func TestBlockClearedTextsWorksAgain(t *testing.T) {
+	h := newHarness(t)
+	h.checker.err = &BlockedError{Status: 541}
+
+	h.runFor(40 * time.Minute)
+
+	h.checker.err = nil
+	h.runFor(30 * time.Minute)
+
+	if len(h.texter.sent) != 2 || !strings.Contains(h.texter.sent[1], "work again") {
+		t.Fatalf("sent = %q, want block text then work again text", h.texter.sent)
+	}
+
+	// Blocked lookups at 0, 5, 15, 35; the good one at 65; then every minute.
+	if got := fmt.Sprint(h.callMinutes()); got != "[0 5 15 35 65 66 67 68 69]" {
+		t.Errorf("lookups at minutes %s", got)
+	}
+}
+
+// TestShortBlockNoText checks a block that clears before 30 minutes sends
+// no texts at all.
+func TestShortBlockNoText(t *testing.T) {
+	h := newHarness(t)
+	h.checker.err = &BlockedError{Status: 541}
+
+	h.runFor(10 * time.Minute)
+
+	h.checker.err = nil
+	h.runFor(20 * time.Minute)
+
+	if len(h.texter.sent) != 0 {
+		t.Errorf("sent %q, want no texts", h.texter.sent)
+	}
+
+	if !h.w.blockedSince.IsZero() {
+		t.Error("block state should be cleared")
+	}
+}
+
+// TestBlockKeepsTextingAlerts checks stock seen before a block keeps its 3
+// minute texts while the watcher waits out the block.
+func TestBlockKeepsTextingAlerts(t *testing.T) {
+	h := newHarness(t)
+	h.checker.set("R077", "A/A", true)
+	h.w.CheckOnce(context.Background())
+
+	h.checker.err = &BlockedError{Status: 541}
+	h.clock = h.clock.Add(time.Minute)
+	h.runFor(9 * time.Minute)
+
+	// Texts at 0:00, 3:00, 6:00 and 9:00.
+	if len(h.texter.sent) != 4 {
+		t.Errorf("sent %d texts, want 4", len(h.texter.sent))
 	}
 }
 
