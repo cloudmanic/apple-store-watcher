@@ -17,9 +17,9 @@ import (
 	"time"
 )
 
-// textSlack lets a text go out a little early, so normal timer drift does
-// not push it back a whole check.
-const textSlack = time.Second
+// timerSlack lets a timed step (a text, or a retry after a block) happen a
+// little early, so normal timer drift does not push it back a whole check.
+const timerSlack = time.Second
 
 // maxTextLength keeps a text under Twilio's 1,600 character limit, with room
 // for the footer.
@@ -120,7 +120,7 @@ func (w *Watcher) CheckOnce(ctx context.Context) {
 	w.checks++
 	started := w.now()
 
-	if started.Before(w.blockedUntil) {
+	if started.Add(timerSlack).Before(w.blockedUntil) {
 		w.log.Info("waiting out apple block; no lookup this check",
 			"check", w.checks,
 			"blocked_for", started.Sub(w.blockedSince).Round(time.Second),
@@ -373,7 +373,7 @@ func (w *Watcher) maybeText(ctx context.Context, now time.Time) {
 	if !w.lastText.IsZero() {
 		next := w.lastText.Add(w.cfg.TextInterval())
 
-		if now.Before(next.Add(-textSlack)) {
+		if now.Add(timerSlack).Before(next) {
 			w.log.Info("text not due yet",
 				"last_text", w.lastText.Format(time.TimeOnly),
 				"next_text_in", next.Sub(now).Round(time.Second),

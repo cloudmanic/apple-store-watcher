@@ -344,6 +344,22 @@ func TestBlockBacksOff(t *testing.T) {
 	}
 }
 
+// TestBlockRetryToleratesTimerDrift checks a tick that fires a moment
+// before the wait ends still makes the retry, instead of waiting a whole
+// extra check.
+func TestBlockRetryToleratesTimerDrift(t *testing.T) {
+	h := newHarness(t)
+	h.checker.err = &BlockedError{Status: 541}
+	h.w.CheckOnce(context.Background())
+
+	h.clock = h.start.Add(blockBackoffStart - 200*time.Millisecond)
+	h.w.CheckOnce(context.Background())
+
+	if len(h.checker.calls) != 2 {
+		t.Errorf("made %d lookups, want 2", len(h.checker.calls))
+	}
+}
+
 // TestBlockTextsOnceAfterThirtyMinutes checks the user gets one text when a
 // block reaches 30 minutes, and no more while it lasts.
 func TestBlockTextsOnceAfterThirtyMinutes(t *testing.T) {
