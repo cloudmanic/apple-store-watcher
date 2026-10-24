@@ -26,7 +26,7 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
-// TestLoadConfigAppliesDefaults checks a minimal config gets the 30 second,
+// TestLoadConfigAppliesDefaults checks a minimal config gets the 60 second,
 // 3 minute, 30 text defaults.
 func TestLoadConfigAppliesDefaults(t *testing.T) {
 	path := writeConfig(t, `{
@@ -40,8 +40,8 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if cfg.CheckInterval() != 30*time.Second {
-		t.Errorf("check interval = %v, want 30s", cfg.CheckInterval())
+	if cfg.CheckInterval() != 60*time.Second {
+		t.Errorf("check interval = %v, want 60s", cfg.CheckInterval())
 	}
 
 	if cfg.TextInterval() != 3*time.Minute {

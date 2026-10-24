@@ -6,7 +6,7 @@ Copyright: 2026 Cloudmanic Labs, LLC. All rights reserved.
 
 # apple-store-watcher
 
-Checks Apple Stores for in-store pickup stock every 30 seconds. When a watched
+Checks Apple Stores for in-store pickup stock every 60 seconds. When a watched
 product is in stock, it sends a text through Twilio.
 
 ## Setup
@@ -59,7 +59,7 @@ Logs go to the screen and to `watcher.log`.
 
 | Key | Default | What it does |
 |---|---|---|
-| `check_interval_seconds` | 30 | Time between stock checks |
+| `check_interval_seconds` | 60 | Time between stock checks |
 | `text_interval_seconds` | 180 | Shortest time between texts |
 | `max_texts_per_trigger` | 30 | Texts per alert before it stops |
 | `log_file` | `watcher.log` | Where the log file goes |

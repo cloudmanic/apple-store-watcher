@@ -78,7 +78,7 @@ type testHarness struct {
 }
 
 // newHarness builds a watcher with two stores, two products, one phone
-// number, and a 30 second check / 3 minute text / 30 text limit.
+// number, and the default 60 second check / 3 minute text / 30 text limit.
 func newHarness(t *testing.T) *testHarness {
 	t.Helper()
 
@@ -103,9 +103,9 @@ func newHarness(t *testing.T) *testHarness {
 	return h
 }
 
-// runFor runs one check every 30 seconds for the given time, starting now.
+// runFor runs one check per check interval for the given time, starting now.
 func (h *testHarness) runFor(d time.Duration) {
-	for end := h.clock.Add(d); h.clock.Before(end); h.clock = h.clock.Add(30 * time.Second) {
+	for end := h.clock.Add(d); h.clock.Before(end); h.clock = h.clock.Add(h.w.cfg.CheckInterval()) {
 		h.w.CheckOnce(context.Background())
 	}
 }
@@ -132,9 +132,9 @@ func TestStockTextsRightAwayThenEveryThreeMinutes(t *testing.T) {
 		t.Fatalf("sent %d texts after first check, want 1", len(h.texter.sent))
 	}
 
-	// Checks at 0:30 through 9:30 should text at 3:00, 6:00 and 9:00.
-	h.clock = h.clock.Add(30 * time.Second)
-	h.runFor(9*time.Minute + 30*time.Second)
+	// Checks at 1:00 through 9:00 should text at 3:00, 6:00 and 9:00.
+	h.clock = h.clock.Add(time.Minute)
+	h.runFor(9 * time.Minute)
 
 	if len(h.texter.sent) != 4 {
 		t.Errorf("sent %d texts in 10 minutes, want 4", len(h.texter.sent))
@@ -203,15 +203,16 @@ func TestSoldOutAndBackStartsNewTrigger(t *testing.T) {
 func TestFlickeringStockStillWaitsThreeMinutes(t *testing.T) {
 	h := newHarness(t)
 
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 10; i++ {
 		h.checker.set("R077", "A/A", i%2 == 0)
 		h.w.CheckOnce(context.Background())
-		h.clock = h.clock.Add(30 * time.Second)
+		h.clock = h.clock.Add(time.Minute)
 	}
 
-	// 20 checks cover 0:00 to 9:30, so texts at 0:00, 3:00, 6:00 and 9:00.
-	if len(h.texter.sent) != 4 {
-		t.Errorf("sent %d texts, want 4", len(h.texter.sent))
+	// Stock is in on even minutes from 0:00 to 8:00. Texts go out at 0:00,
+	// 4:00 and 8:00; 2:00 and 6:00 are too soon after the last text.
+	if len(h.texter.sent) != 3 {
+		t.Errorf("sent %d texts, want 3", len(h.texter.sent))
 	}
 }
 
@@ -266,7 +267,7 @@ func TestFailedTextRetriesNextCheck(t *testing.T) {
 	h.w.CheckOnce(context.Background())
 
 	h.texter.err = nil
-	h.clock = h.clock.Add(30 * time.Second)
+	h.clock = h.clock.Add(h.w.cfg.CheckInterval())
 	h.w.CheckOnce(context.Background())
 
 	if len(h.texter.sent) != 1 {

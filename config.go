@@ -20,7 +20,7 @@ import (
 
 // Default settings used when config.json leaves a value out.
 const (
-	defaultCheckIntervalSeconds = 30
+	defaultCheckIntervalSeconds = 60
 	defaultTextIntervalSeconds  = 180
 	defaultMaxTextsPerTrigger   = 30
 	defaultLogFile              = "watcher.log"
