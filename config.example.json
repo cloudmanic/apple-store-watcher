@@ -1,0 +1,23 @@
+{
+  "check_interval_seconds": 30,
+  "text_interval_seconds": 180,
+  "max_texts_per_trigger": 30,
+  "log_file": "watcher.log",
+  "text_to": ["+15035551234"],
+  "text_link": "https://www.apple.com/shop/buy-iphone/iphone-duo",
+  "stores": [
+    { "number": "R077", "name": "Pioneer Place (Portland)" },
+    { "number": "R090", "name": "Washington Square (Tigard)" },
+    { "number": "R134", "name": "Bridgeport Village (Tualatin)" }
+  ],
+  "products": [
+    { "part": "MK1E4LL/A", "name": "iPhone Duo 256GB Star White" },
+    { "part": "MK1F4LL/A", "name": "iPhone Duo 256GB Night Sky" },
+    { "part": "MK1G4LL/A", "name": "iPhone Duo 512GB Star White" },
+    { "part": "MK1H4LL/A", "name": "iPhone Duo 512GB Night Sky" },
+    { "part": "MK1J4LL/A", "name": "iPhone Duo 1TB Star White" },
+    { "part": "MK1L4LL/A", "name": "iPhone Duo 1TB Night Sky" },
+    { "part": "MK1Q4LL/A", "name": "iPhone Duo 2TB Star White" },
+    { "part": "MK1R4LL/A", "name": "iPhone Duo 2TB Night Sky" }
+  ]
+}

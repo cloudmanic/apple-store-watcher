@@ -1,0 +1,19 @@
+#
+# Date: 2026-10-24
+# Author: Spicer Matthews (spicer@cloudmanic.com)
+# Copyright: 2026 Cloudmanic Labs, LLC. All rights reserved.
+#
+
+# Local settings and secrets
+config.json
+.env
+
+# Logs
+*.log
+
+# Build output
+/apple-store-watcher
+
+# Browser tool scratch folders
+.playwright/
+.playwright-cli/
