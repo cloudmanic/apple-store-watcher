@@ -87,16 +87,18 @@ type testHarness struct {
 }
 
 // newHarness builds a watcher with two stores, two products, one phone
-// number, and the default 60 second check / 3 minute text / 30 text limit.
+// number, a 60 second check, and the default 3 minute text / 30 text limit.
+// The short check lets tests see the 3 minute text gap work.
 func newHarness(t *testing.T) *testHarness {
 	t.Helper()
 
 	cfg := &Config{
-		TextTo:         []string{"+15035551234"},
-		TextLink:       "https://example.com/buy",
-		SearchLocation: "97201",
-		Stores:         []Store{{Number: "R077", Name: "Pioneer Place"}, {Number: "R090", Name: "Washington Square"}},
-		Products:       []Product{{Part: "A/A", Name: "Phone A"}, {Part: "B/A", Name: "Phone B"}},
+		CheckIntervalSeconds: 60,
+		TextTo:               []string{"+15035551234"},
+		TextLink:             "https://example.com/buy",
+		SearchLocation:       "97201",
+		Stores:               []Store{{Number: "R077", Name: "Pioneer Place"}, {Number: "R090", Name: "Washington Square"}},
+		Products:             []Product{{Part: "A/A", Name: "Phone A"}, {Part: "B/A", Name: "Phone B"}},
 	}
 	cfg.applyDefaults()
 
@@ -360,32 +362,25 @@ func TestBlockRetryToleratesTimerDrift(t *testing.T) {
 	}
 }
 
-// TestBlockTextsOnceAfterThirtyMinutes checks the user gets one text when a
-// block reaches 30 minutes, and no more while it lasts.
-func TestBlockTextsOnceAfterThirtyMinutes(t *testing.T) {
+// TestLongBlockNeverTexts checks a block of any length, and its end, send no
+// texts, so errors never wake the user.
+func TestLongBlockNeverTexts(t *testing.T) {
 	h := newHarness(t)
 	h.checker.err = &BlockedError{Status: 541}
 
+	h.runFor(8 * time.Hour)
+
+	h.checker.err = nil
 	h.runFor(30 * time.Minute)
 
 	if len(h.texter.sent) != 0 {
-		t.Fatalf("sent %d texts before 30 minutes, want 0", len(h.texter.sent))
-	}
-
-	h.runFor(2 * time.Hour)
-
-	if len(h.texter.sent) != 1 {
-		t.Fatalf("sent %d texts, want 1", len(h.texter.sent))
-	}
-
-	if !strings.Contains(h.texter.sent[0], "blocked stock checks for 30 minutes") {
-		t.Errorf("text = %q", h.texter.sent[0])
+		t.Errorf("sent %q, want no texts", h.texter.sent)
 	}
 }
 
-// TestBlockClearedTextsWorksAgain checks that after a long block, the first
-// good lookup texts "work again" and checks go back to every minute.
-func TestBlockClearedTextsWorksAgain(t *testing.T) {
+// TestBlockClearedGoesBackToNormalChecks checks the first good lookup after
+// a block clears the block, and checks go back to the normal interval.
+func TestBlockClearedGoesBackToNormalChecks(t *testing.T) {
 	h := newHarness(t)
 	h.checker.err = &BlockedError{Status: 541}
 
@@ -394,33 +389,13 @@ func TestBlockClearedTextsWorksAgain(t *testing.T) {
 	h.checker.err = nil
 	h.runFor(30 * time.Minute)
 
-	if len(h.texter.sent) != 2 || !strings.Contains(h.texter.sent[1], "work again") {
-		t.Fatalf("sent = %q, want block text then work again text", h.texter.sent)
+	if !h.w.blockedSince.IsZero() {
+		t.Error("block state should be cleared")
 	}
 
 	// Blocked lookups at 0, 5, 15, 35; the good one at 65; then every minute.
 	if got := fmt.Sprint(h.callMinutes()); got != "[0 5 15 35 65 66 67 68 69]" {
 		t.Errorf("lookups at minutes %s", got)
-	}
-}
-
-// TestShortBlockNoText checks a block that clears before 30 minutes sends
-// no texts at all.
-func TestShortBlockNoText(t *testing.T) {
-	h := newHarness(t)
-	h.checker.err = &BlockedError{Status: 541}
-
-	h.runFor(10 * time.Minute)
-
-	h.checker.err = nil
-	h.runFor(20 * time.Minute)
-
-	if len(h.texter.sent) != 0 {
-		t.Errorf("sent %q, want no texts", h.texter.sent)
-	}
-
-	if !h.w.blockedSince.IsZero() {
-		t.Error("block state should be cleared")
 	}
 }
 

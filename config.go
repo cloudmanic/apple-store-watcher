@@ -18,9 +18,10 @@ import (
 	"time"
 )
 
-// Default settings used when config.json leaves a value out.
+// Default settings used when config.json leaves a value out. Apple blocks
+// lookups made once a minute, so checks run every 5 minutes.
 const (
-	defaultCheckIntervalSeconds = 60
+	defaultCheckIntervalSeconds = 300
 	defaultTextIntervalSeconds  = 180
 	defaultMaxTextsPerTrigger   = 30
 	defaultLogFile              = "watcher.log"

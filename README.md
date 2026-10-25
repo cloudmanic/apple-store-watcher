@@ -6,8 +6,9 @@ Copyright: 2026 Cloudmanic Labs, LLC. All rights reserved.
 
 # apple-store-watcher
 
-Checks Apple Stores for in-store pickup stock every 60 seconds. When a watched
-product is in stock, it sends a text through Twilio.
+Checks Apple Stores for in-store pickup stock every 5 minutes. When a watched
+product is in stock, it sends a text through Twilio. Stock is the only thing
+it texts about. Errors go to the log only.
 
 ## Setup
 
@@ -48,10 +49,10 @@ Logs go to the screen and to `watcher.log`.
 ## How texting works
 
 - Each store + product pair that comes in stock is one alert.
-- The first text goes out right away. More texts go out every 3 minutes while
+- The first text goes out right away. More texts go out at each check while
   the item stays in stock.
 - One text lists every in-stock item. Texts never go out more than once per
-  3 minutes.
+  3 minutes (`text_interval_seconds`).
 - Each alert stops after 30 texts. If the item sells out and comes back, it
   starts a new alert.
 
@@ -62,17 +63,17 @@ Logs go to the screen and to `watcher.log`.
   config.
 - If a watched store is not in the reply, the log says so. Pick a zip code
   closer to that store.
-- Apple blocks lookups if we ask too often. It sends HTTP 541 with a
-  "Page Not Found" page. When that happens, the watcher waits 5 minutes,
-  then 10, then 20, then 30 between tries.
-- If a block lasts 30 minutes, you get one text. When checks work again, you
-  get a second text.
+- Apple blocks lookups if we ask too often. Once a minute was too often. It
+  sends HTTP 541 with a "Page Not Found" page. When that happens, the watcher
+  waits 5 minutes, then 10, then 20, then 30 between tries.
+- A block never sends a text. Look for `APPLE IS BLOCKING` and
+  `apple block cleared` in `watcher.log`.
 
 ## Config
 
 | Key | Default | What it does |
 |---|---|---|
-| `check_interval_seconds` | 60 | Time between stock checks |
+| `check_interval_seconds` | 300 | Time between stock checks |
 | `text_interval_seconds` | 180 | Shortest time between texts |
 | `max_texts_per_trigger` | 30 | Texts per alert before it stops |
 | `log_file` | `watcher.log` | Where the log file goes |

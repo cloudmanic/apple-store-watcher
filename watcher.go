@@ -25,11 +25,10 @@ const timerSlack = time.Second
 // for the footer.
 const maxTextLength = 1400
 
-// How the watcher reacts when Apple blocks stock checks.
+// How long the watcher waits between tries when Apple blocks stock checks.
 const (
 	blockBackoffStart = 5 * time.Minute  // wait after the first blocked check
 	blockBackoffMax   = 30 * time.Minute // longest wait between tries
-	blockTextAfter    = 30 * time.Minute // text the user once a block lasts this long
 )
 
 // StockChecker is the part of AppleClient the watcher needs. Tests use a fake.
@@ -56,6 +55,8 @@ type trigger struct {
 }
 
 // Watcher checks Apple on a timer and texts when watched stock shows up.
+// Stock is the only thing it ever texts about, because a text can wake the
+// user at night. Errors and blocks go to the log only.
 type Watcher struct {
 	cfg      *Config
 	checker  StockChecker
@@ -67,10 +68,9 @@ type Watcher struct {
 	checks   int
 
 	// Block state. blockedSince is zero when Apple is not blocking us.
-	blockedSince  time.Time
-	blockedUntil  time.Time
-	backoff       time.Duration
-	blockTextSent bool
+	blockedSince time.Time
+	blockedUntil time.Time
+	backoff      time.Duration
 }
 
 // NewWatcher wires a watcher to the real clock. Tests replace now so they
@@ -127,7 +127,6 @@ func (w *Watcher) CheckOnce(ctx context.Context) {
 			"next_try_in", w.blockedUntil.Sub(started).Round(time.Second),
 		)
 
-		w.maybeBlockText(ctx, started)
 		w.maybeText(ctx, started)
 
 		return
@@ -151,7 +150,6 @@ func (w *Watcher) CheckOnce(ctx context.Context) {
 		var blocked *BlockedError
 		if errors.As(err, &blocked) {
 			w.noteBlocked(started, blocked)
-			w.maybeBlockText(ctx, started)
 		} else {
 			w.log.Error("stock check failed; keeping current alerts and trying again next check",
 				"check", w.checks,
@@ -164,7 +162,7 @@ func (w *Watcher) CheckOnce(ctx context.Context) {
 		return
 	}
 
-	w.noteUnblocked(ctx, started)
+	w.noteUnblocked(started)
 
 	byStore := map[string][]Availability{}
 	for _, r := range results {
@@ -248,43 +246,18 @@ func (w *Watcher) noteBlocked(now time.Time, err *BlockedError) {
 	)
 }
 
-// noteUnblocked clears the block state after a good reply. If the user was
-// told about the block, it tells them checks work again.
-func (w *Watcher) noteUnblocked(ctx context.Context, now time.Time) {
+// noteUnblocked clears the block state after a good reply, so checks go back
+// to the normal interval.
+func (w *Watcher) noteUnblocked(now time.Time) {
 	if w.blockedSince.IsZero() {
 		return
 	}
 
 	w.log.Warn("apple block cleared; checks work again", "blocked_for", now.Sub(w.blockedSince).Round(time.Second))
 
-	if w.blockTextSent {
-		w.sendToAll(ctx, "Apple store watcher: stock checks work again.")
-	}
-
 	w.blockedSince = time.Time{}
 	w.blockedUntil = time.Time{}
 	w.backoff = 0
-	w.blockTextSent = false
-}
-
-// maybeBlockText texts the user once when a block has lasted
-// blockTextAfter. During a block the watcher cannot see stock, and without
-// this text it would stay silent.
-func (w *Watcher) maybeBlockText(ctx context.Context, now time.Time) {
-	if w.blockedSince.IsZero() || w.blockTextSent {
-		return
-	}
-
-	blockedFor := now.Sub(w.blockedSince)
-	if blockedFor < blockTextAfter {
-		return
-	}
-
-	body := fmt.Sprintf("Apple store watcher: Apple has blocked stock checks for %d minutes. The watcher cannot see stock right now. It keeps trying.", int(blockedFor.Minutes()))
-
-	if w.sendToAll(ctx, body) > 0 {
-		w.blockTextSent = true
-	}
 }
 
 // updateTriggers starts a trigger for each newly in-stock item and clears

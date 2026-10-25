@@ -1,5 +1,5 @@
 {
-  "check_interval_seconds": 60,
+  "check_interval_seconds": 300,
   "text_interval_seconds": 180,
   "max_texts_per_trigger": 30,
   "log_file": "watcher.log",
